@@ -1,0 +1,14 @@
+{
+  "name": "mafia-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mafia Online — браузерная мафия (React + Node.js + Socket.IO), PWA",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix client install",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "test": "npm --prefix server test"
+  }
+}
