@@ -1,6 +1,6 @@
 // Service worker: оболочка приложения кэшируется, поэтому оно запускается мгновенно и без сети.
 // Сами игровые данные идут через WebSocket и офлайн недоступны.
-const CACHE = 'mafia-online-v1';
+const CACHE = 'mafia-online-v2';
 const SHELL = ['/', '/index.html', '/manifest.webmanifest', '/favicon.svg', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {

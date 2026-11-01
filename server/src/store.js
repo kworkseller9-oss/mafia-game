@@ -1,4 +1,4 @@
-// Простое файловое хранилище профилей (JSON). Для продакшена замените на БД.
+// Хранилище профилей: PostgreSQL (Neon) при DATABASE_URL, иначе JSON-файл. Данные держим в памяти, пишем с задержкой.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,26 +7,172 @@ import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash } from
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FILE = process.env.DATA_FILE || path.join(__dirname, '..', 'data', 'users.json');
 const PERSIST = process.env.NO_PERSIST !== '1';
+const DATABASE_URL = process.env.DATABASE_URL || '';
 
 let db = { users: {} };
-try {
-  if (PERSIST && fs.existsSync(FILE)) db = JSON.parse(fs.readFileSync(FILE, 'utf8'));
-} catch (e) {
-  console.error('Не удалось прочитать users.json, начинаем с пустой базы', e.message);
+
+// ---------- Хранилище: PostgreSQL (Neon) при DATABASE_URL, иначе JSON-файл ----------
+/** @type {{kind: string, load: () => Promise<any>, persist: (data: any) => Promise<void>} | null} */
+let driver = null;
+
+function fileDriver() {
+  const bak = FILE + '.bak';
+  return {
+    kind: `JSON-файл (${FILE})`,
+    async load() {
+      for (const f of [FILE, bak]) {
+        if (!fs.existsSync(f)) continue;
+        try {
+          return JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch (e) {
+          // битый файл не затираем, а откладываем в сторону — аккаунты можно будет вытащить руками
+          console.error(`Не удалось прочитать ${f}: ${e.message}`);
+          try {
+            fs.renameSync(f, `${f}.corrupt-${Date.now()}`);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      return null;
+    },
+    async persist(data) {
+      // атомарная запись: во временный файл, затем rename; предыдущая версия остаётся в .bak
+      fs.mkdirSync(path.dirname(FILE), { recursive: true });
+      const tmp = FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(data));
+      if (fs.existsSync(FILE)) fs.copyFileSync(FILE, bak);
+      fs.renameSync(tmp, FILE);
+    },
+  };
+}
+
+async function pgDriver() {
+  const pg = globalThis.__mafiaPgForTests || (await import('pg')).default; // подмена нужна только тестам
+  const noSslParam = !/[?&]sslmode=/.test(DATABASE_URL) && !/@(localhost|127\.0\.0\.1)/.test(DATABASE_URL);
+  const pool = new pg.Pool({
+    connectionString: DATABASE_URL,
+    max: 3,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 15000,
+    ssl: noSslParam ? true : undefined,
+  });
+  // Neon закрывает простаивающие соединения — без обработчика это роняло бы процесс
+  pool.on('error', (e) => console.error('pg pool error:', e.message));
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS mafia_users (
+    id text PRIMARY KEY,
+    data jsonb NOT NULL,
+    updated_at timestamptz NOT NULL
+  )`);
+  await pool.query('CREATE TABLE IF NOT EXISTS mafia_meta (key text PRIMARY KEY, value jsonb NOT NULL)');
+
+  let known = new Map(); // id -> JSON последней сохранённой версии (пишем только изменившееся)
+  let knownAdmin = null;
+  return {
+    kind: 'PostgreSQL (DATABASE_URL)',
+    async load() {
+      const u = await pool.query('SELECT id, data FROM mafia_users');
+      const m = await pool.query("SELECT value FROM mafia_meta WHERE key = 'admin'");
+      const users = {};
+      for (const r of u.rows) {
+        users[r.id] = r.data;
+        known.set(r.id, JSON.stringify(r.data));
+      }
+      const admin = m.rows[0]?.value || undefined;
+      knownAdmin = admin ? JSON.stringify(admin) : null;
+      return { users, admin };
+    },
+    async persist(data) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const next = new Map();
+        for (const [id, u] of Object.entries(data.users)) {
+          const js = JSON.stringify(u);
+          next.set(id, js);
+          if (known.get(id) !== js) {
+            await client.query(
+              'INSERT INTO mafia_users (id, data, updated_at) VALUES ($1, $2::jsonb, $3) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at',
+              [id, js, new Date()],
+            );
+          }
+        }
+        for (const id of known.keys()) {
+          if (!next.has(id)) await client.query('DELETE FROM mafia_users WHERE id = $1', [id]);
+        }
+        const adm = data.admin ? JSON.stringify(data.admin) : null;
+        if (adm && adm !== knownAdmin) {
+          await client.query(
+            "INSERT INTO mafia_meta (key, value) VALUES ('admin', $1::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            [adm],
+          );
+        }
+        await client.query('COMMIT');
+        known = next;
+        knownAdmin = adm;
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
+    },
+  };
 }
 
 let saveTimer = null;
+let chain = Promise.resolve();
+let dirty = false;
+
 function save() {
-  if (!PERSIST) return;
+  if (!driver) return;
+  dirty = true;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(() => flush(), 400);
+}
+
+/** Дождаться записи всех накопленных изменений (вызывается и при остановке сервера). */
+export function flush() {
+  clearTimeout(saveTimer);
+  if (!driver) return Promise.resolve();
+  chain = chain.then(async () => {
+    if (!dirty) return;
+    dirty = false;
     try {
-      fs.mkdirSync(path.dirname(FILE), { recursive: true });
-      fs.writeFileSync(FILE, JSON.stringify(db));
+      await driver.persist(db);
     } catch (e) {
-      console.error('Ошибка сохранения', e.message);
+      dirty = true;
+      console.error('Ошибка сохранения (повторим через 5 с):', e.message);
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => flush(), 5000);
     }
-  }, 400);
+  });
+  return chain;
+}
+
+export const storageKind = () => driver?.kind || 'только память (NO_PERSIST=1)';
+
+export async function init() {
+  if (!PERSIST) return;
+  driver = DATABASE_URL ? await pgDriver() : fileDriver();
+  const loaded = await driver.load();
+  if (loaded && typeof loaded === 'object') db = { ...loaded, users: loaded.users || {} };
+
+  // Первый запуск с Postgres: переносим аккаунты из старого users.json, если он есть
+  if (DATABASE_URL && Object.keys(db.users).length === 0 && fs.existsSync(FILE)) {
+    try {
+      const old = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+      if (old?.users && Object.keys(old.users).length) {
+        db = { ...old, users: old.users };
+        console.log(`Перенесено аккаунтов из ${FILE} в PostgreSQL: ${Object.keys(old.users).length}`);
+        dirty = true;
+        await flush();
+      }
+    } catch (e) {
+      console.error('Не удалось перенести данные из JSON:', e.message);
+    }
+  }
 }
 
 // ---------- Каталог магазина ----------

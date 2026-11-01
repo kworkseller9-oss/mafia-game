@@ -73,6 +73,9 @@ export function beep(freq = 520, dur = 0.12, enabled = true) {
   }
 }
 
+// Сервер присылает «осталось мс», а не абсолютное время: часы телефона могут расходиться с серверными
+const normRoom = (r) => (r ? { ...r, timerEnd: r.timerLeft ? Date.now() + r.timerLeft : 0 } : r);
+
 export function AppProvider({ children }) {
   const [connected, setConnected] = useState(socket.connected);
   const [ready, setReady] = useState(false);
@@ -136,7 +139,7 @@ export function AppProvider({ children }) {
         setProfile(res.profile);
         setRooms(res.rooms);
         setOnline(res.online);
-        setRoom(res.room);
+        setRoom(normRoom(res.room));
         setReady(true);
       });
     };
@@ -156,7 +159,8 @@ export function AppProvider({ children }) {
     socket.on('rooms', setRooms);
     socket.on('online', setOnline);
     socket.on('profile', setProfile);
-    socket.on('room:state', setRoom);
+    const onState = (r) => setRoom(normRoom(r));
+    socket.on('room:state', onState);
     socket.on('room:kicked', () => {
       setRoom(null);
       showToast('Вас исключили из комнаты', 'error');
@@ -174,7 +178,7 @@ export function AppProvider({ children }) {
       socket.off('rooms', setRooms);
       socket.off('online', setOnline);
       socket.off('profile', setProfile);
-      socket.off('room:state', setRoom);
+      socket.off('room:state', onState);
       socket.off('room:kicked');
       socket.off('auth:revoked', onRevoked);
       window.removeEventListener('beforeinstallprompt', onInstall);
@@ -222,18 +226,18 @@ export function AppProvider({ children }) {
       },
       createRoom: async (data) => {
         const r = await wrap(call('room:create', data));
-        if (r.ok) setRoom(r.room);
+        if (r.ok) setRoom(normRoom(r.room));
         return r;
       },
       joinRoom: async (id, password) => {
         const r = await call('room:join', { id, password });
         if (!r.ok && r.error && !r.needPassword) showToast(r.error, 'error');
-        if (r.ok) setRoom(r.room);
+        if (r.ok) setRoom(normRoom(r.room));
         return r;
       },
       quick: async () => {
         const r = await wrap(call('room:quick'));
-        if (r.ok) setRoom(r.room);
+        if (r.ok) setRoom(normRoom(r.room));
         return r;
       },
       leave: async () => {

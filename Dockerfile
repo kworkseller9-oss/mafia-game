@@ -13,7 +13,7 @@ COPY server/package*.json ./server/
 RUN cd server && npm install --omit=dev --no-audit --no-fund
 COPY server/ ./server/
 COPY --from=client /app/client/dist ./client/dist
-ENV PORT=3001 DATA_FILE=/data/users.json
+ENV NODE_ENV=production PORT=3001 DATA_FILE=/data/users.json
 VOLUME /data
 EXPOSE 3001
 CMD ["node", "server/src/index.js"]

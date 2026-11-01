@@ -13,11 +13,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+// За прокси хостинга (Render/Railway/Fly…) req.ip иначе будет адресом прокси, и лимит попыток входа
+// заблокирует сразу всех. Число прыжков задаётся TRUST_PROXY (по умолчанию 1 в production).
+const tp = process.env.TRUST_PROXY ?? (process.env.NODE_ENV === 'production' ? '1' : '');
+if (tp) app.set('trust proxy', /^\d+$/.test(tp) ? Number(tp) : tp === 'true' ? true : tp);
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'same-origin',
+  });
+  next();
+});
+const CORS_ORIGIN = process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map((x) => x.trim()) : '*';
+app.use(cors({ origin: CORS_ORIGIN }));
+app.use(express.json({ limit: '20kb' }));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: CORS_ORIGIN }, maxHttpBufferSize: 1e4 });
 
 /** @type {Map<string, Game>} */
 const rooms = new Map();
@@ -61,9 +75,20 @@ app.use('/api/admin', createAdminRouter({ revokeUser, isOnline: (id) => userSock
 
 const dist = path.join(__dirname, '..', '..', 'client', 'dist');
 if (fs.existsSync(dist)) {
-  app.use(express.static(dist));
+  app.use(
+    express.static(dist, {
+      setHeaders: (res, file) => {
+        // имена файлов в /assets содержат хеш — можно кэшировать надолго; остальное всегда перепроверяем
+        if (file.includes(`${path.sep}assets${path.sep}`)) res.set('Cache-Control', 'public, max-age=31536000, immutable');
+        else res.set('Cache-Control', 'no-cache');
+      },
+    }),
+  );
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) return next();
+    // несуществующий файл (js/css/png…) — честный 404, а не index.html, иначе после обновления «ломается» старый кэш
+    if (path.extname(req.path)) return res.status(404).end();
+    res.set('Cache-Control', 'no-cache');
     res.sendFile(path.join(dist, 'index.html'));
   });
 }
@@ -88,6 +113,8 @@ function broadcastRooms() {
 
 function pushRoom(room) {
   for (const p of room.humans()) {
+    // вышедший из партии игрок остаётся в списке (за него играет автопилот), но обновления ему больше не шлём
+    if (userRoom.get(p.id) !== room.id) continue;
     emitToUser(p.id, 'room:state', room.view(p.id));
   }
 }
@@ -119,11 +146,15 @@ function leaveCurrentRoom(userId) {
   const room = rooms.get(rid);
   if (!room) return;
   room.removePlayer(userId);
-  if (room.connectedHumans().length === 0) {
-    room.destroy();
-    rooms.delete(rid);
-  }
+  dropRoomIfEmpty(room);
   broadcastRooms();
+}
+
+function dropRoomIfEmpty(room) {
+  if (room.connectedHumans().length > 0) return;
+  room.destroy();
+  rooms.delete(room.id);
+  for (const p of room.humans()) if (userRoom.get(p.id) === room.id) userRoom.delete(p.id);
 }
 
 function joinRoom(user, room) {
@@ -143,8 +174,39 @@ function joinRoom(user, room) {
 
 // ---------- сокеты ----------
 io.on('connection', (socket) => {
-  /** @type {import('./store.js').getUser} */
+  /** @type {ReturnType<typeof store.getUser>} */
   let user = null;
+
+  // Ограничение частоты событий: всплеск до 40, дальше ~15 событий/сек
+  let bucket = 40;
+  let last = Date.now();
+  const allow = () => {
+    const now = Date.now();
+    bucket = Math.min(40, bucket + ((now - last) / 1000) * 15);
+    last = now;
+    if (bucket < 1) return false;
+    bucket -= 1;
+    return true;
+  };
+
+  /**
+   * Безопасная регистрация обработчика: кривые данные или не-функция вместо callback
+   * не должны ронять весь сервер (раньше socket.emit('room:join', null) валил процесс).
+   */
+  const on = (event, fn, hasData = true) =>
+    socket.on(event, (...args) => {
+      const lastArg = args[args.length - 1];
+      const cb = typeof lastArg === 'function' ? lastArg : undefined;
+      const data = hasData && typeof args[0] !== 'function' ? args[0] : undefined;
+      try {
+        if (!allow()) return cb?.({ ok: false, error: 'Слишком часто, подождите секунду' });
+        if (hasData) fn(data, cb);
+        else fn(cb);
+      } catch (e) {
+        console.error(`[socket:${event}]`, e);
+        cb?.({ ok: false, error: 'Ошибка сервера' });
+      }
+    });
 
   const need = (cb) => {
     if (!user) {
@@ -159,14 +221,18 @@ io.on('connection', (socket) => {
     return true;
   };
   const myRoom = () => rooms.get(userRoom.get(user?.id));
+  const obj = (d) => (d && typeof d === 'object' ? d : {});
 
-  socket.on('hello', ({ token, name } = {}, cb) => {
+  on('hello', (data, cb) => {
+    const { token, name } = obj(data);
     // Регистрации нет: войти можно только в аккаунт, который создал админ.
     // ALLOW_GUESTS=1 возвращает старое поведение (гостевой вход) — нужно только для тестов.
-    let u = store.getUserByToken(token);
+    let u = typeof token === 'string' ? store.getUserByToken(token) : null;
     if (!u && process.env.ALLOW_GUESTS === '1') u = store.getOrCreateUser(token, name);
     if (!u) return cb?.({ ok: false, needLogin: true });
     if (u.blocked) return cb?.({ ok: false, needLogin: true, error: 'Аккаунт заблокирован администратором' });
+    // этот же сокет раньше мог принадлежать другому аккаунту (смена пользователя без переподключения)
+    if (user && user.id !== u.id) userSockets.get(user.id)?.delete(socket);
     user = u;
     socket.join('lobby');
     if (!userSockets.has(user.id)) userSockets.set(user.id, new Set());
@@ -189,18 +255,19 @@ io.on('connection', (socket) => {
     broadcastRooms();
   });
 
-  socket.on('rooms:list', (cb) => need(cb) && cb?.({ ok: true, rooms: roomsList() }));
+  on('rooms:list', (cb) => need(cb) && cb?.({ ok: true, rooms: roomsList() }), false);
 
-  socket.on('room:create', (data = {}, cb) => {
+  on('room:create', (data, cb) => {
     if (!need(cb)) return;
-    const mode = MODES[data.mode] ? data.mode : 'classic';
+    const d = obj(data);
+    const mode = MODES[d.mode] ? d.mode : 'classic';
     leaveCurrentRoom(user.id);
     const room = makeRoom({
-      name: String(data.name || '').replace(/[<>]/g, '').trim().slice(0, 24) || `Комната ${user.name}`,
+      name: String(d.name || '').replace(/[<>]/g, '').trim().slice(0, 24) || `Комната ${user.name}`,
       mode,
-      max: Number(data.max) || MODES[mode].max,
-      isPrivate: !!data.isPrivate || mode === 'friends',
-      password: String(data.password || '').slice(0, 16),
+      max: Number(d.max) || MODES[mode].max,
+      isPrivate: !!d.isPrivate || mode === 'friends',
+      password: String(d.password || '').slice(0, 16),
       host: user,
     });
     userRoom.set(user.id, room.id);
@@ -208,61 +275,86 @@ io.on('connection', (socket) => {
     cb?.({ ok: true, room: room.view(user.id) });
   });
 
-  socket.on('room:join', ({ id, password } = {}, cb) => {
+  on('room:join', (data, cb) => {
     if (!need(cb)) return;
+    const { id, password } = obj(data);
+    // защита от перебора кодов комнат и паролей
+    const key = 'join:' + user.id;
+    if (tooMany(key)) return cb?.({ ok: false, error: 'Слишком много неудачных попыток. Подождите немного.' });
     const room = rooms.get(String(id || '').toUpperCase().trim());
-    if (!room) return cb?.({ ok: false, error: 'Комната не найдена' });
-    if (room.password && room.password !== password && !room.byId(user.id)) {
+    if (!room) {
+      fail(key);
+      return cb?.({ ok: false, error: 'Комната не найдена' });
+    }
+    if (room.password && room.password !== String(password ?? '') && !room.byId(user.id)) {
+      fail(key);
       return cb?.({ ok: false, error: 'Неверный пароль', needPassword: true });
     }
+    clearFail(key);
     const r = joinRoom(user, room);
     cb?.({ ...r, room: r.ok ? room.view(user.id) : null });
   });
 
   // «Быстрая игра»: вход в открытую комнату или создание новой с ботами
-  socket.on('room:quick', (cb) => {
-    if (!need(cb)) return;
-    let room = [...rooms.values()].find(
-      (r) => !r.isPrivate && !r.password && r.phase === 'lobby' && r.players.length < r.max && !r.byId(user.id) && r.humans().length > 0,
-    );
-    if (room) {
-      const r = joinRoom(user, room);
-      return cb?.({ ...r, room: r.ok ? room.view(user.id) : null });
-    }
-    leaveCurrentRoom(user.id);
-    room = makeRoom({ name: `Быстрая ${user.name}`, mode: 'quick', max: 6, isPrivate: false, host: user });
-    while (room.players.length < 6) room.addBot();
-    userRoom.set(user.id, room.id);
-    room.start();
-    cb?.({ ok: true, room: room.view(user.id) });
-  });
+  on(
+    'room:quick',
+    (cb) => {
+      if (!need(cb)) return;
+      let room = [...rooms.values()].find(
+        (r) => !r.isPrivate && !r.password && r.phase === 'lobby' && r.players.length < r.max && !r.byId(user.id) && r.humans().length > 0,
+      );
+      if (room) {
+        const r = joinRoom(user, room);
+        return cb?.({ ...r, room: r.ok ? room.view(user.id) : null });
+      }
+      leaveCurrentRoom(user.id);
+      room = makeRoom({ name: `Быстрая ${user.name}`, mode: 'quick', max: 6, isPrivate: false, host: user });
+      while (room.players.length < 6) room.addBot();
+      userRoom.set(user.id, room.id);
+      room.start();
+      cb?.({ ok: true, room: room.view(user.id) });
+    },
+    false,
+  );
 
-  socket.on('room:leave', (cb) => {
-    if (!need(cb)) return;
-    leaveCurrentRoom(user.id);
-    cb?.({ ok: true });
-  });
+  on(
+    'room:leave',
+    (cb) => {
+      if (!need(cb)) return;
+      leaveCurrentRoom(user.id);
+      cb?.({ ok: true });
+    },
+    false,
+  );
 
-  socket.on('room:addBot', (cb) => {
-    if (!need(cb)) return;
-    const room = myRoom();
-    if (!room || room.hostId !== user.id || room.phase !== 'lobby') return cb?.({ ok: false });
-    if (room.players.length >= room.max) return cb?.({ ok: false, error: 'Комната заполнена' });
-    room.addBot();
-    room.onChange(room);
-    cb?.({ ok: true });
-  });
+  on(
+    'room:addBot',
+    (cb) => {
+      if (!need(cb)) return;
+      const room = myRoom();
+      if (!room || room.hostId !== user.id || room.phase !== 'lobby') return cb?.({ ok: false });
+      if (room.players.length >= room.max) return cb?.({ ok: false, error: 'Комната заполнена' });
+      room.addBot();
+      room.onChange(room);
+      cb?.({ ok: true });
+    },
+    false,
+  );
 
-  socket.on('room:fillBots', (cb) => {
-    if (!need(cb)) return;
-    const room = myRoom();
-    if (!room || room.hostId !== user.id || room.phase !== 'lobby') return cb?.({ ok: false });
-    while (room.players.length < room.cfg.min) room.addBot();
-    room.onChange(room);
-    cb?.({ ok: true });
-  });
+  on(
+    'room:fillBots',
+    (cb) => {
+      if (!need(cb)) return;
+      const room = myRoom();
+      if (!room || room.hostId !== user.id || room.phase !== 'lobby') return cb?.({ ok: false });
+      while (room.players.length < room.cfg.min) room.addBot();
+      room.onChange(room);
+      cb?.({ ok: true });
+    },
+    false,
+  );
 
-  socket.on('room:kick', (targetId, cb) => {
+  on('room:kick', (targetId, cb) => {
     if (!need(cb)) return;
     const room = myRoom();
     if (!room || room.hostId !== user.id || room.phase !== 'lobby' || targetId === user.id) return cb?.({ ok: false });
@@ -276,28 +368,37 @@ io.on('connection', (socket) => {
     cb?.({ ok: true });
   });
 
-  socket.on('room:start', (cb) => {
-    if (!need(cb)) return;
-    const room = myRoom();
-    if (!room || room.hostId !== user.id) return cb?.({ ok: false, error: 'Только хозяин комнаты' });
-    cb?.(room.start());
-  });
+  on(
+    'room:start',
+    (cb) => {
+      if (!need(cb)) return;
+      const room = myRoom();
+      if (!room || room.hostId !== user.id) return cb?.({ ok: false, error: 'Только хозяин комнаты' });
+      cb?.(room.start());
+    },
+    false,
+  );
 
-  socket.on('room:again', (cb) => {
-    if (!need(cb)) return;
-    const room = myRoom();
-    if (!room || room.hostId !== user.id) return cb?.({ ok: false, error: 'Только хозяин комнаты' });
-    cb?.(room.again());
-  });
+  on(
+    'room:again',
+    (cb) => {
+      if (!need(cb)) return;
+      const room = myRoom();
+      if (!room || room.hostId !== user.id) return cb?.({ ok: false, error: 'Только хозяин комнаты' });
+      cb?.(room.again());
+    },
+    false,
+  );
 
-  socket.on('game:act', (data, cb) => {
+  on('game:act', (data, cb) => {
     if (!need(cb)) return;
     const room = myRoom();
     if (!room) return cb?.({ ok: false, error: 'Вы не в комнате' });
-    cb?.(room.act(user.id, data || {}));
+    const d = obj(data);
+    cb?.(room.act(user.id, { type: String(d.type || ''), target: d.target == null ? undefined : String(d.target) }));
   });
 
-  socket.on('chat:send', (text, cb) => {
+  on('chat:send', (text, cb) => {
     if (!need(cb)) return;
     const room = myRoom();
     if (!room) return cb?.({ ok: false });
@@ -305,19 +406,20 @@ io.on('connection', (socket) => {
   });
 
   // профиль / магазин
-  socket.on('profile:rename', (name, cb) => {
+  on('profile:rename', (name, cb) => {
     if (!need(cb)) return;
     const r = store.rename(user, name);
+    if (r.ok) myRoom()?.renameHuman(user.id, user.name);
     pushProfile(user.id);
     cb?.(r);
   });
-  socket.on('shop:buy', (itemId, cb) => {
+  on('shop:buy', (itemId, cb) => {
     if (!need(cb)) return;
     const r = store.buy(user, itemId);
     pushProfile(user.id);
     cb?.(r);
   });
-  socket.on('shop:selectSkin', (skinId, cb) => {
+  on('shop:selectSkin', (skinId, cb) => {
     if (!need(cb)) return;
     const r = store.selectSkin(user, skinId);
     const room = myRoom();
@@ -332,27 +434,22 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (!user) return;
-    const set = userSockets.get(user.id);
+    const uid = user.id;
+    const set = userSockets.get(uid);
     set?.delete(socket);
     if (set && set.size === 0) {
-      userSockets.delete(user.id);
-      const room = myRoom();
-      if (room) {
-        // небольшая пауза на случай перезагрузки страницы
-        const uid = user.id;
+      userSockets.delete(uid);
+      if (myRoom()) {
+        // небольшая пауза на случай перезагрузки страницы / кратковременного обрыва связи
         setTimeout(() => {
           if (userSockets.has(uid)) return;
-          const rid = userRoom.get(uid);
-          const r = rooms.get(rid);
+          const r = rooms.get(userRoom.get(uid));
           if (!r) return;
           if (r.phase === 'lobby' || r.phase === 'end') leaveCurrentRoom(uid);
           else {
+            // в партии игрок остаётся «отключённым»: за него играет автопилот, вернуться можно по hello
             r.removePlayer(uid);
-            if (r.connectedHumans().length === 0) {
-              r.destroy();
-              rooms.delete(rid);
-              userRoom.delete(uid);
-            }
+            dropRoomIfEmpty(r);
           }
           broadcastRooms();
         }, 4000);
@@ -362,12 +459,39 @@ io.on('connection', (socket) => {
   });
 });
 
-const adm = store.ensureAdmin();
-server.listen(PORT, () => {
-  console.log(`Mafia Online server: http://localhost:${PORT}`);
-  console.log(`Админ-панель:        http://localhost:${PORT}/admin`);
-  if (adm.password) console.log(`\nПАРОЛЬ АДМИНИСТРАТОРА (показан один раз): ${adm.password}\nЧтобы задать свой — запустите с переменной ADMIN_PASSWORD.\n`);
-  else if (adm.source === 'saved') console.log('Пароль администратора сохранён с первого запуска (задать новый: переменная ADMIN_PASSWORD).');
+// Сервер не должен падать из-за одной необработанной ошибки в партии
+process.on('uncaughtException', (e) => console.error('uncaughtException', e));
+process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
+
+async function main() {
+  await store.init();
+  const adm = store.ensureAdmin();
+  server.listen(PORT, () => {
+    console.log(`Mafia Online server: http://localhost:${PORT}`);
+    console.log(`Админ-панель:        http://localhost:${PORT}/admin`);
+    console.log(`Хранилище:           ${store.storageKind()}`);
+    if (adm.password) console.log(`\nПАРОЛЬ АДМИНИСТРАТОРА (показан один раз): ${adm.password}\nЧтобы задать свой — запустите с переменной ADMIN_PASSWORD.\n`);
+    else if (adm.source === 'saved') console.log('Пароль администратора сохранён с первого запуска (задать новый: переменная ADMIN_PASSWORD).');
+  });
+}
+
+// при остановке (деплой, Ctrl+C) дописываем несохранённые изменения
+let stopping = false;
+async function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  try {
+    await store.flush();
+  } finally {
+    process.exit(0);
+  }
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+main().catch((e) => {
+  console.error('Не удалось запустить сервер:', e);
+  process.exit(1);
 });
 
 export { io, rooms };

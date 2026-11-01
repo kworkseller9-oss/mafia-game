@@ -5,6 +5,12 @@ import * as store from './store.js';
 // ---- простая защита от подбора пароля: 8 неудач за 10 минут с одного адреса — блок ----
 const fails = new Map();
 const WINDOW = 10 * 60 * 1000;
+// чистим старые записи, чтобы карта не росла бесконечно
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, f] of fails) if (now > f.until) fails.delete(k);
+}, 5 * 60 * 1000).unref();
+
 export function tooMany(key) {
   const f = fails.get(key);
   return !!f && f.n >= 8 && Date.now() < f.until;

@@ -139,6 +139,73 @@ for (const r of results) {
   assert(gen.password && store.adminCheck(gen.password) && !store.adminCheck('x'), 'сгенерированный пароль админа');
 }
 
+// билеты ролей: конфликт двух билетов на одну роль не должен «съедать» билет без роли
+{
+  let broken = 0;
+  let granted = 0;
+  for (let i = 0; i < 300; i++) {
+    const a = store.getOrCreateUser('tk-a' + i, 'A');
+    const b = store.getOrCreateUser('tk-b' + i, 'B');
+    a.tickets.commissar = 1;
+    b.tickets.commissar = 1;
+    const room = new Game({ name: 'tk', mode: 'classic', max: 6, host: a, fastBots: true, onChange: () => {}, onFinish: () => {} });
+    room.addHuman(b);
+    while (room.players.length < 6) room.addBot();
+    room.start();
+    const pa = room.byId(a.id);
+    const pb = room.byId(b.id);
+    const spent = (1 - a.tickets.commissar) + (1 - b.tickets.commissar);
+    const have = [pa, pb].filter((p) => p.role === 'commissar').length;
+    granted += have;
+    // каждый списанный билет обязан соответствовать реально выданной роли комиссара
+    if (spent !== have || have > 1) broken++;
+    room.destroy();
+  }
+  assert(broken === 0, `билеты: списано ровно столько, сколько выдано ролей (нарушений: ${broken})`);
+  assert(granted > 0, 'билет комиссара срабатывает');
+}
+
+// вернувшийся человек не получает «автоходов», запланированных на время отсутствия
+{
+  const u = store.getOrCreateUser('rt1', 'Back');
+  const room = new Game({ name: 'rt', mode: 'classic', max: 6, host: u, fastBots: true, onChange: () => {}, onFinish: () => {} });
+  while (room.players.length < 6) room.addBot();
+  room.start();
+  room.removePlayer(u.id); // ушёл на автопилот: запланированы ходы
+  room.reconnect(u.id); // тут же вернулся
+  await new Promise((r) => setTimeout(r, 50));
+  const me = room.byId(u.id);
+  const acted = room.night.mafia[u.id] || (me.role === 'commissar' && room.night.check) || (me.role === 'doctor' && room.night.heal);
+  assert(!acted, 'автопилот не ходит за вернувшегося игрока');
+  assert(!room.chat.some((m) => m.from === u.id && m.type !== 'system'), 'автопилот не пишет в чат за вернувшегося игрока');
+  room.destroy();
+}
+
+// ушедший из партии не получает награду
+{
+  const u = store.getOrCreateUser('lv1', 'Leaver');
+  const finished = new Promise((resolve) => {
+    const room = new Game({ name: 'lv', mode: 'quick', max: 6, host: u, fastBots: true, onChange: () => {}, onFinish: resolve });
+    while (room.players.length < 6) room.addBot();
+    room.start();
+    room.removePlayer(u.id); // ушёл сразу
+  });
+  const r = await finished;
+  assert(!r.rewards[u.id] && u.games === 0 && u.coins === 1250, 'ушедший из партии не получает монеты и статистику');
+  r.destroy();
+}
+
+// нельзя голосовать за себя
+{
+  const u = store.getOrCreateUser('sv1', 'Self');
+  const room = new Game({ name: 'sv', mode: 'classic', max: 6, host: u, onChange: () => {}, onFinish: () => {} });
+  while (room.players.length < 6) room.addBot();
+  room.start();
+  room.startVote();
+  assert(!room.act(u.id, { type: 'vote', target: u.id }).ok, 'голос за себя отклоняется');
+  room.destroy();
+}
+
 console.log(`Партий: ${results.length}, победы мафии: ${stats.mafia}, мирных: ${stats.civilians}`);
 if (failures) {
   console.error(`Провалено проверок: ${failures}`);

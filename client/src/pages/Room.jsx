@@ -196,6 +196,7 @@ function Game({ room }) {
     if (!actionType || !p.alive) return false;
     if (actionType === 'kill' && p.role === 'mafia') return false;
     if (actionType === 'check' && p.id === profile.id) return false;
+    if (actionType === 'vote' && p.id === profile.id) return false;
     return true;
   };
 

@@ -134,7 +134,7 @@ export class Game {
         const next = this.players.find((x) => !x.isBot && x.connected);
         this.hostId = next ? next.id : this.hostId;
       }
-      this.scheduleBots();
+      this.scheduleBots(p.id);
       this.checkAdvanceEarly();
     }
     this.onChange(this);
@@ -145,6 +145,14 @@ export class Game {
     if (p && !p.connected) {
       p.connected = true;
       this.sys(`${p.name} вернулся в игру`);
+      this.onChange(this);
+    }
+  }
+
+  renameHuman(id, name) {
+    const p = this.byId(id);
+    if (p && this.phase === 'lobby') {
+      p.name = name;
       this.onChange(this);
     }
   }
@@ -225,7 +233,9 @@ export class Game {
       p.revealed = false;
       p.checks = [];
     });
-    // Билеты ролей: меняемся ролью с тем, у кого нужная роль, если он без билета на неё
+    // Билеты ролей: меняемся ролью с тем, у кого нужная роль. Роль, выданная по билету, «закреплена»:
+    // её нельзя забрать другим билетом, а билет списывается, только если роль реально получена.
+    const locked = new Set();
     for (const p of ps) {
       if (p.isBot) continue;
       const u = store.getUser(p.id);
@@ -234,13 +244,14 @@ export class Game {
         if (!store.hasTicket(u, want)) continue;
         if (!roles.includes(want)) continue; // роли нет в этом режиме
         if (p.role !== want) {
-          const holder = ps.find((x) => x.role === want);
-          if (holder) {
-            [holder.role, p.role] = [p.role, holder.role];
-          }
+          const holder = ps.find((x) => x.role === want && !locked.has(x.id));
+          if (!holder) continue; // все такие роли уже закреплены за другими билетами
+          [holder.role, p.role] = [p.role, holder.role];
         }
-        if (p.role === want) store.consumeTicket(u, want);
-        break;
+        if (p.role === want && store.consumeTicket(u, want)) {
+          locked.add(p.id);
+          break;
+        }
       }
     }
   }
@@ -361,7 +372,7 @@ export class Game {
     this.sys(winner === 'mafia' ? '🏆 Победа мафии!' : '🏆 Победа мирных жителей!');
     this.rewards = {};
     for (const p of this.players) {
-      if (p.isBot) continue;
+      if (p.isBot || !p.connected) continue; // ушедшие из партии наград не получают
       const u = store.getUser(p.id);
       if (!u) continue;
       const won = (p.role === 'mafia') === (winner === 'mafia');
@@ -417,6 +428,7 @@ export class Game {
       if (target === 'skip') this.votes[p.id] = 'skip';
       else {
         if (!t || !t.alive) return { ok: false, error: 'Выберите живого игрока' };
+        if (t.id === p.id) return { ok: false, error: 'Нельзя голосовать за себя' };
         this.votes[p.id] = t.id;
       }
     } else if (type === 'ready') {
@@ -458,55 +470,57 @@ export class Game {
   }
 
   // ---------- боты ----------
-  scheduleBots() {
+  /** onlyId — запланировать действия только для одного игрока (когда он перешёл на автопилот посреди фазы). */
+  scheduleBots(onlyId = null) {
     const phase = this.phase;
     const dur = this.cfg.t[phase] * 1000;
-    const at = (min, max, fn) => {
+    const day = this.day;
+    // Действие выполняется, только если игрок всё ещё на автопилоте: вернувшийся человек не должен получать «чужие» ходы
+    const at = (id, min, max, fn) => {
       const delay = this.fastBots ? 0 : Math.min(rnd(min, max), dur * 0.8);
-      this.botTimers.push(setTimeout(() => this.phase === phase && fn(), delay));
+      this.botTimers.push(
+        setTimeout(() => {
+          const p = this.byId(id);
+          if (this.phase === phase && this.day === day && p && p.alive && this.isAuto(p)) fn();
+        }, delay),
+      );
     };
     const alive = this.alive();
-    const autos = alive.filter((p) => this.isAuto(p));
+    const autos = alive.filter((p) => this.isAuto(p) && (!onlyId || p.id === onlyId));
 
     if (phase === 'night') {
-      const mafia = alive.filter((p) => p.role === 'mafia');
       for (const b of autos) {
         if (b.role === 'mafia') {
-          at(2500, 8000, () => {
+          at(b.id, 2500, 8000, () => {
             const targets = this.alive().filter((x) => x.role !== 'mafia');
             const claimers = targets.filter((x) => this.claims.has(x.id));
             if (targets.length) this.act(b.id, { type: 'kill', target: pick(claimers.length ? claimers : targets).id });
           });
         } else if (b.role === 'commissar') {
-          at(3000, 9000, () => {
+          at(b.id, 3000, 9000, () => {
             const known = new Set(b.checks.map((c) => c.targetId));
             const targets = this.alive().filter((x) => x.id !== b.id && !known.has(x.id));
             if (targets.length) this.act(b.id, { type: 'check', target: pick(targets).id });
-            else this.night.check = this.night.check || 'none';
-            this.checkAdvanceEarly();
+            else {
+              this.night.check = this.night.check || 'none';
+              this.checkAdvanceEarly();
+            }
           });
         } else if (b.role === 'doctor') {
-          at(3000, 9000, () => this.act(b.id, { type: 'heal', target: pick(this.alive()).id }));
+          at(b.id, 3000, 9000, () => this.act(b.id, { type: 'heal', target: pick(this.alive()).id }));
         }
       }
-      void mafia;
     } else if (phase === 'day') {
       for (const b of autos) {
         const lines = Math.floor(rnd(1, 4));
         for (let i = 0; i < lines; i++) {
-          at(3000 + i * 9000, 9000 + i * 12000, () => {
-            if (!this.byId(b.id)?.alive) return;
-            this.say(b.id, this.botLine(b));
-          });
+          at(b.id, 3000 + i * 9000, 9000 + i * 12000, () => this.say(b.id, this.botLine(b)));
         }
-        at(dur * 0.45, dur * 0.7, () => this.act(b.id, { type: 'ready' }));
+        at(b.id, dur * 0.45, dur * 0.7, () => this.act(b.id, { type: 'ready' }));
       }
     } else if (phase === 'vote') {
       for (const b of autos) {
-        at(2500, 10000, () => {
-          const target = this.botVoteTarget(b);
-          this.act(b.id, { type: 'vote', target });
-        });
+        at(b.id, 2500, 10000, () => this.act(b.id, { type: 'vote', target: this.botVoteTarget(b) }));
       }
     }
   }
@@ -621,7 +635,7 @@ export class Game {
       hostId: this.hostId,
       phase: this.phase,
       day: this.day,
-      timerEnd: this.timerEnd,
+      timerLeft: this.timerEnd ? Math.max(0, this.timerEnd - Date.now()) : 0,
       winner: this.winner,
       rewards: this.rewards[userId] || null,
       players,
